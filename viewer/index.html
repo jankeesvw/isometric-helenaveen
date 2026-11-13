@@ -585,11 +585,14 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
     coords.innerHTML = `<b>GPS</b> ${nl(lat, 4)}° N · ${nl(lon, 4)}° ${L('O', 'E')}`;
   }
 
+  let smoothing = null;
   function updateZoom() {
     const z = viewer.viewport.viewportToImageZoom(viewer.viewport.getZoom(true));
     // From one map pixel per screen pixel up, show the pixels as pixels. Counted in device pixels: on a HiDPI
     // screen a map pixel already covers more than one device pixel from zoom 0.5, and smoothing that upscale blurs it.
-    viewer.drawer.setImageSmoothingEnabled(z * (window.devicePixelRatio || 1) < 1);
+    // Only when it changes: every call makes OpenSeadragon redraw the whole map.
+    const smooth = z * (window.devicePixelRatio || 1) < 1;
+    if (smooth !== smoothing) viewer.drawer.setImageSmoothingEnabled((smoothing = smooth));
     const ratio = z >= 1 ? `${nl(z, 1)}×` : `1:${nl(1 / z, 1)}`;
     scaleEl.textContent = `1 pixel = ${nl(100 / M.scale, 0)} cm · zoom ${ratio}`;
   }
@@ -673,6 +676,13 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
     }
   }
 
+  // Tiles that cover the screen, for the map and its objects layer, at two zoom levels, plus half again for panning.
+  function tileBudget() {
+    const dpr = window.devicePixelRatio || 1;
+    const across = Math.ceil((screen.width * dpr) / 1024) + 1, down = Math.ceil((screen.height * dpr) / 1024) + 1;
+    return Math.max(48, Math.ceil(across * down * 2 * 2 * 1.5));
+  }
+
   // The tiles are WebP; OpenSeadragon 4 only needs to be told the browser can show them.
   OpenSeadragon.setImageFormatsSupported({ webp: true });
 
@@ -719,6 +729,10 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
       imageSmoothingEnabled: true,
       gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: true },
       preserveImageSizeOnResize: true,
+      // OpenSeadragon keeps 200 tiles by default, sized for 256 px tiles. Ours are 1024 px, and each one it has drawn
+      // also keeps a canvas copy: 200 of them hold well over a gigabyte, which slows the whole browser down when the map
+      // stays open. Keep enough for two zoom levels of both layers on this screen, with some room to pan back.
+      maxImageCacheCount: tileBudget(),
     });
     viewer.addHandler('open', () => {
       if (!openPin()) goHome(true);
@@ -1269,6 +1283,8 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
     lights.id = 'light-layer';
     layer.after(lights);
     off = document.createElement('canvas');
+    viewer.addHandler('animation', () => (moving = true));
+    viewer.addHandler('animation-finish', () => (moving = false));
     requestAnimationFrame(frame);
   }
 
@@ -1799,8 +1815,14 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
     };
   }
 
-  let lastFrame = 0, clock = 0;
+  // Every frame repaints the traffic and, with movers behind something, the whole map under it, and with it the blur
+  // and color filters over the map. While the map stands still, 30 frames a second is plenty for the traffic (a 120 Hz
+  // screen would otherwise do it four times as often); while it moves, every frame, so the traffic keeps up with it.
+  const TRAFFIC_FPS = 30;
+  let lastFrame = 0, clock = 0, moving = false;
   function frame(t) {
+    requestAnimationFrame(frame);
+    if (!moving && lastFrame && t - lastFrame < 1000 / TRAFFIC_FPS - 4) return;
     const dt = Math.min(0.1, (t - (lastFrame || t)) / 1000);
     lastFrame = t;
     step(dt);
@@ -1810,7 +1832,6 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
     draw();
     drawLights();
     if (objectsLayer && (had || behind.length)) viewer.forceRedraw(); // so the movers between the layers move too
-    requestAnimationFrame(frame);
   }
 
 
@@ -1956,8 +1977,10 @@ Werk stap voor stap, controleer de licenties van de data die je gebruikt, en vra
       const best = Math.min(top, top + Math.ceil(Math.log2(viewer.drawer.canvas.width / b.width)));
       for (const level of [best - 1, best]) {
         const f = 2 ** (level - top), size = 1024;
-        const [x0, x1] = [(t.x - b.width / 2) * f, (t.x + b.width / 2) * f].map((q) => Math.floor(Math.max(0, q) / size));
-        const [y0, y1] = [(t.y - b.height / 2) * f, (t.y + b.height / 2) * f].map((q) => Math.floor(Math.max(0, q) / size));
+        // Only tiles that exist: none left of or above the image, nor right of or below it.
+        const clamp = (q, full) => Math.floor(Math.min(Math.max(0, q), Math.ceil(full * f) - 1) / size);
+        const [x0, x1] = [(t.x - b.width / 2) * f, (t.x + b.width / 2) * f].map((q) => clamp(q, M.width));
+        const [y0, y1] = [(t.y - b.height / 2) * f, (t.y + b.height / 2) * f].map((q) => clamp(q, M.height));
         for (const url of [v.tiles, v.objects].filter(Boolean)) {
           for (let col = x0; col <= x1; col++) for (let row = y0; row <= y1; row++) new Image().src = `${url}${level}/${col}_${row}.webp`;
         }
